@@ -67,10 +67,19 @@ type FloodTest struct {
 	MaxMessageSize       uint32                       `toml:"max_message_size"`
 	ReconnectOnError     bool                         `toml:"reconnect_on_error"`
 	ReconnectInterval    int32                        `toml:"reconnect_interval"`
+	LateBindTimestamp    bool			  `toml:"late_bind_timestamp"`
 	msgInterval          time.Duration
 }
 
 type FloodConfig map[string]FloodTest
+
+type FloodMessages []FloodMessage
+
+type FloodMessage struct {
+	message *message.Message
+	msgBytes []byte
+	encoder client.StreamEncoder
+}
 
 func timerLoop(count, bytes *uint64, ticker *time.Ticker) {
 	lastTime := time.Now().UTC()
@@ -108,10 +117,10 @@ func timerLoop(count, bytes *uint64, ticker *time.Ticker) {
 	}
 }
 
-func makeVariableMessage(encoder client.StreamEncoder, items int,
-	rdm *randomDataMaker, oversized bool) [][]byte {
+func makeVariableMessage(test FloodTest, encoder client.StreamEncoder, items int,
+	rdm *randomDataMaker, oversized bool) FloodMessages {
 
-	ma := make([][]byte, items)
+	ma := make(FloodMessages, items)
 	hostname, _ := os.Hostname()
 	pid := int32(os.Getpid())
 	var cnt int
@@ -119,7 +128,6 @@ func makeVariableMessage(encoder client.StreamEncoder, items int,
 	for x := 0; x < items; x++ {
 		msg := &message.Message{}
 		msg.SetUuid(uuid.NewRandom())
-		msg.SetTimestamp(time.Now().UnixNano())
 		msg.SetType("hekabench")
 		msg.SetLogger("flood")
 		msg.SetEnvVersion("0.2")
@@ -162,11 +170,19 @@ func makeVariableMessage(encoder client.StreamEncoder, items int,
 		field, _ := message.NewField("filler", buf, "")
 		msg.AddField(field)
 
-		var stream []byte
-		if err := encoder.EncodeMessageStream(msg, &stream); err != nil {
-			client.LogError.Println(err)
+		if !test.LateBindTimestamp {
+			msg.SetTimestamp(time.Now().UnixNano())
+			ma[x].message = msg
+			var stream []byte
+			if err := encoder.EncodeMessageStream(msg, &stream); err != nil {
+				client.LogError.Println(err)
+			}
+			ma[x].msgBytes = stream
+		} else {
+			ma[x].message = msg
+			ma[x].encoder = encoder
 		}
-		ma[x] = stream
+
 	}
 	return ma
 }
@@ -249,27 +265,35 @@ func CreateHekaStream(msgBytes []byte, outBytes *[]byte) error {
 	return nil
 }
 
-func makeFixedMessage(encoder client.StreamEncoder, size uint64,
-	rdm *randomDataMaker) [][]byte {
+func makeFixedMessage(test FloodTest, encoder client.StreamEncoder, size uint64,
+	rdm *randomDataMaker) FloodMessages {
 
-	ma := make([][]byte, 1)
+	ma := make(FloodMessages, 1)
 	hostname, _ := os.Hostname()
 	pid := int32(os.Getpid())
 
 	msg := &message.Message{}
 	msg.SetType("hekabench")
-	msg.SetTimestamp(time.Now().UnixNano())
 	msg.SetUuid(uuid.NewRandom())
 	msg.SetSeverity(int32(6))
 	msg.SetEnvVersion("0.8")
 	msg.SetPid(pid)
 	msg.SetHostname(hostname)
 	msg.SetPayload(makePayload(size, rdm))
-	var stream []byte
-	if err := encoder.EncodeMessageStream(msg, &stream); err != nil {
-		client.LogError.Println(err)
+
+	if !test.LateBindTimestamp {
+		msg.SetTimestamp(time.Now().UnixNano())
+		ma[0].message = msg
+		var stream []byte
+		if err := encoder.EncodeMessageStream(msg, &stream); err != nil {
+			client.LogError.Println(err)
+		}
+		ma[0].msgBytes = stream
+	} else {
+		ma[0].message = msg
+		ma[0].encoder = encoder
 	}
-	ma[0] = stream
+
 	return ma
 }
 
@@ -287,18 +311,26 @@ func createSender(test FloodTest) (sender *client.NetworkSender, err error) {
 	return
 }
 
-func sendMessage(sender client.Sender, buf []byte, corrupt bool) (err error) {
+func sendMessage(test FloodTest, sender client.Sender, fm FloodMessage, corrupt bool) (err error) {
 	var b byte
 	var index int
+	if test.LateBindTimestamp {
+		fm.message.SetTimestamp(time.Now().UnixNano())
+		var stream []byte
+		if err := fm.encoder.EncodeMessageStream(fm.message, &stream); err != nil {
+			client.LogError.Println(err)
+		}
+		fm.msgBytes = stream
+	}
 	if corrupt {
-		index = rand.Int() % len(buf)
+		index = rand.Int() % len(fm.msgBytes)
 		replacement := rand.Int() % 256
-		b = buf[index]
-		buf[index] = byte(replacement)
-		err = sender.SendMessage(buf)
-		buf[index] = b
+		b = fm.msgBytes[index]
+		fm.msgBytes[index] = byte(replacement)
+		err = sender.SendMessage(fm.msgBytes)
+		fm.msgBytes[index] = b
 	} else {
-		err = sender.SendMessage(buf)
+		err = sender.SendMessage(fm.msgBytes)
 	}
 	return
 }
@@ -376,9 +408,9 @@ func main() {
 	oversizedEncoder := &OversizedEncoder{}
 
 	var numTestMessages = 1
-	var unsignedMessages [][]byte
-	var signedMessages [][]byte
-	var oversizedMessages [][]byte
+	var unsignedMessages FloodMessages
+	var signedMessages FloodMessages
+	var oversizedMessages FloodMessages
 
 	rdm := &randomDataMaker{
 		src:       rand.NewSource(time.Now().UnixNano()),
@@ -387,16 +419,16 @@ func main() {
 
 	if test.VariableSizeMessages {
 		numTestMessages = 64
-		unsignedMessages = makeVariableMessage(unsignedEncoder, numTestMessages, rdm, false)
-		signedMessages = makeVariableMessage(signedEncoder, numTestMessages, rdm, false)
-		oversizedMessages = makeVariableMessage(oversizedEncoder, 1, rdm, true)
+		unsignedMessages = makeVariableMessage(test, unsignedEncoder, numTestMessages, rdm, false)
+		signedMessages = makeVariableMessage(test, signedEncoder, numTestMessages, rdm, false)
+		oversizedMessages = makeVariableMessage(test, oversizedEncoder, 1, rdm, true)
 	} else {
 		if test.StaticMessageSize == 0 {
 			test.StaticMessageSize = 1000
 		}
-		unsignedMessages = makeFixedMessage(unsignedEncoder, test.StaticMessageSize,
+		unsignedMessages = makeFixedMessage(test, unsignedEncoder, test.StaticMessageSize,
 			rdm)
-		signedMessages = makeFixedMessage(signedEncoder, test.StaticMessageSize,
+		signedMessages = makeFixedMessage(test, signedEncoder, test.StaticMessageSize,
 			rdm)
 	}
 	// wait for sigint
@@ -414,7 +446,7 @@ func main() {
 	test.SignedPercentage /= 100.0
 	test.OversizedPercentage /= 100.0
 
-	var buf []byte
+	var msg FloodMessage
 	for gotsigint := false; !gotsigint; {
 		runtime.Gosched()
 		select {
@@ -434,18 +466,18 @@ func main() {
 		signedPercentage = math.Floor(float64(msgsSent) * test.SignedPercentage)
 		if signedPercentage != lastSignedPercentage {
 			lastSignedPercentage = signedPercentage
-			buf = signedMessages[msgId]
+			msg = signedMessages[msgId]
 		} else {
 			oversizedPercentage = math.Floor(float64(msgsSent) * test.OversizedPercentage)
 			if oversizedPercentage != lastOversizedPercentage {
 				lastOversizedPercentage = oversizedPercentage
-				buf = oversizedMessages[0]
+				msg = oversizedMessages[0]
 			} else {
-				buf = unsignedMessages[msgId]
+				msg = unsignedMessages[msgId]
 			}
 		}
-		bytesSent += uint64(len(buf))
-		if err = sendMessage(sender, buf, corrupt); err != nil {
+
+		if err = sendMessage(test, sender, msg, corrupt); err != nil {
 			client.LogError.Printf("Error sending message: %s\n", err.Error())
 			if test.ReconnectOnError {
 				for {
@@ -464,6 +496,7 @@ func main() {
 		} else {
 			msgsDelivered++
 		}
+		bytesSent += uint64(len(msg.msgBytes))
 		msgsSent++
 		if test.NumMessages != 0 && msgsSent >= test.NumMessages {
 			break

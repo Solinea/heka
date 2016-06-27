@@ -94,6 +94,14 @@ Configuration Variables
     Specifies interval (in seconds) after which `heka-flood` will try to recreate connection with backend.
     Defaults to 5s.
 
+.. versionadded:: 0.11
+
+- late_bind_timestamp (bool):
+	Defines if `heka-flood` assigns message timestamp at initilization time or at send time.
+	Late binding is useful if you need time ordered messages in the output, but may reduce the overall
+	performance of the flood process.
+	Defaults to false.
+
 Example
 
 .. code-block:: ini
